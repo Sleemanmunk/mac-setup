@@ -10,16 +10,18 @@ if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   exit 1
 fi
 
-sudo -v
-( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
-KEEPALIVE=$!
-trap 'kill "$KEEPALIVE" 2>/dev/null || true' EXIT
+if ! [[ -x /opt/homebrew/bin/brew || -x /usr/local/bin/brew ]]; then
+  sudo -v
+  ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+  KEEPALIVE=$!
+  trap 'kill "$KEEPALIVE" 2>/dev/null || true' EXIT
 
-NONINTERACTIVE=1 /bin/bash -c \
-  "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  NONINTERACTIVE=1 /bin/bash -c \
+    "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-kill "$KEEPALIVE" 2>/dev/null || true
-trap - EXIT
+  kill "$KEEPALIVE" 2>/dev/null || true
+  trap - EXIT
+fi
 
 if [[ -x /opt/homebrew/bin/brew ]]; then
   PREFIX=/opt/homebrew
