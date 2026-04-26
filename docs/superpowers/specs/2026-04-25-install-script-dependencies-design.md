@@ -52,21 +52,29 @@ bash-shell ──► bash-init ──┘            └─► maccy
 ```
 
 - `xcode-clt`: required by `homebrew` (brew bootstrap depends on the Xcode Command Line Tools)
-- `bash-shell`: chsh's the user to `/bin/bash`; required by `bash-init`
+- `bash-shell`: sets the user's login shell to `/bin/bash`; required by `bash-init`
 - `bash-init`: ensures `~/.bashrc` exists and is sourced from `~/.bash_profile`; required by `homebrew` (so brew's shellenv line can be written once to `.bashrc` and seen by all shell types)
 - `homebrew`: required by `claude-code` and `maccy` (and any future cask install)
 
+## Working directory and invocation
+
+Every install script begins with `cd "$(dirname "$0")"` so that the project root is the working directory regardless of where the user invokes the script from. After this `cd`:
+
+- All install scripts are siblings in the current directory (`./install-<name>.sh`)
+- `lib/common.sh` is at a known relative path (`./lib/common.sh`)
+- `require` resolves dependencies via simple relative paths — no `BASH_SOURCE`/`dirname` gymnastics in the helper
+
+This trades one boilerplate line at the top of each script for a much simpler `require` implementation and predictable file references throughout.
+
 ## `lib/common.sh`
 
-Provides:
+Sourced by every install script after the `cd` to project root. Provides:
 
 - `log "msg"` — colored info line (existing helper, lifted from current script)
 - `have <cmd>` — `command -v <cmd> >/dev/null 2>&1` (existing helper)
-- `require <name>` — runs `bash install-<name>.sh verify`; if it fails, runs `bash install-<name>.sh install`. Subprocess (not source) to keep function namespaces clean across scripts.
+- `require <name>` — runs `bash ./install-<name>.sh verify`; if it fails, runs `bash ./install-<name>.sh install`. Subprocess (not source) to keep function namespaces clean across scripts.
 - `add_shell_init_line "<line>"` — idempotent `grep -F`-then-append to `~/.bashrc` (bash case). Cases for other shells (`zsh`) error out with a "add this manually" message until implemented.
 - `load_brew_env` — `eval "$(/opt/homebrew/bin/brew shellenv)"` with `/usr/local` fallback, for callers that need brew on PATH in the current shell after `require homebrew`.
-
-`require` resolves dependency scripts relative to the directory of the calling script (siblings on disk).
 
 ## Per-script behavior
 
@@ -77,17 +85,24 @@ Provides:
 
 ### `install-bash-shell.sh`
 
-- `verify`: `[[ "$(dscl . -read "$HOME" UserShell 2>/dev/null | awk '{print $2}')" == "/bin/bash" ]]`. `dscl` is used (not `$SHELL`) because `$SHELL` doesn't update mid-session after `chsh`.
-- `install`: `chsh -s /bin/bash`. Prompts for the user's login password (separate from sudo). No `/etc/shells` edit needed — `/bin/bash` is already listed by default on macOS.
+- `verify`: `[[ "$(dscl . -read "$HOME" UserShell 2>/dev/null | awk '{print $2}')" == "/bin/bash" ]]`. `dscl` is used (not `$SHELL`) because `$SHELL` doesn't update mid-session after a shell change.
+- `install`: `sudo dscl . -change "$HOME" UserShell <current-shell> /bin/bash`. Uses `sudo dscl` rather than `chsh -s` so that the user enters their sudo password once for the whole chain — `homebrew` also uses sudo within the same minute, and sudo's session cache covers both calls (no second prompt). Using `chsh -s` would prompt for the user's login password separately, on top of the sudo prompt brew needs. No `/etc/shells` check needed — `dscl` doesn't enforce that, and the field is just a stored value. The current-shell argument is read from `dscl . -read "$HOME" UserShell` before the change.
 
 ### `install-bash-init.sh`
 
 Depends on: `bash-shell`.
 
-- `verify`: `~/.bashrc` exists AND `~/.bash_profile` contains a line that sources `~/.bashrc`.
+This script owns the "shell init plumbing for a bash user" invariant. That includes both setting up bash's init files correctly *and* cleaning up stale brew shellenv lines left in zsh init files by the previous version of `install-claude-code.sh` (which wrote to `~/.zprofile`). The cleanup is part of bash-init's scope rather than a separate migration script because the user will only ever have one shell-init story, and bash-init is the script that owns it.
+
+- `verify` — all of:
+  - `~/.bashrc` exists
+  - `~/.bash_profile` contains a line that sources `~/.bashrc`
+  - `~/.zprofile` does not exist OR does not contain a `brew shellenv` line
+  - `~/.zshrc` does not exist OR does not contain a `brew shellenv` line
 - `install`:
   - `touch ~/.bashrc` if missing
   - if `~/.bash_profile` doesn't already source `.bashrc`, append `[ -f ~/.bashrc ] && . ~/.bashrc`
+  - remove any line matching `brew shellenv` from `~/.zprofile` and `~/.zshrc` if those files exist (using `sed -i ''` on macOS; line is removed entirely, not commented out)
 
 ### `install-homebrew.sh`
 
@@ -130,7 +145,7 @@ Depends on: `homebrew`.
 
 ## Failure modes
 
-All non-zero exits are treated equally: caller halts, user re-runs. There is no distinction between "human action required" (CLT GUI, chsh password failure) and "real error" (network failure during brew install). At this scale, that's an acceptable simplification. If retry-vs-bail logic becomes valuable, the contract can grow specific exit codes without breaking existing scripts.
+All non-zero exits are treated equally: caller halts, user re-runs. There is no distinction between "human action required" (CLT GUI installer in progress) and "real error" (network failure during brew install, sudo password rejected). At this scale, that's an acceptable simplification. If retry-vs-bail logic becomes valuable, the contract can grow specific exit codes without breaking existing scripts.
 
 ## Shell init scope
 
