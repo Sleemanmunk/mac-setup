@@ -58,17 +58,19 @@ bash-shell ──► bash-init ──┘            └─► maccy
 
 ## Working directory and invocation
 
-Every install script begins with `cd "$(dirname "$0")"` so that the project root is the working directory regardless of where the user invokes the script from. After this `cd`:
+Scripts are expected to be run from the project root (e.g. `bash install-claude-code.sh`, not `bash /full/path/to/install-claude-code.sh` from elsewhere). This expectation is documented in `README.md`.
 
-- All install scripts are siblings in the current directory (`./install-<name>.sh`)
-- `lib/common.sh` is at a known relative path (`./lib/common.sh`)
-- `require` resolves dependencies via simple relative paths — no `BASH_SOURCE`/`dirname` gymnastics in the helper
+Each script does a one-line sanity check at the top:
 
-This trades one boilerplate line at the top of each script for a much simpler `require` implementation and predictable file references throughout.
+```bash
+[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
+```
+
+If invoked from the wrong directory, the script fails immediately with a clear message instead of producing confusing errors deeper in the flow. With this expectation in place, install scripts and `require` use plain relative paths (`./install-<name>.sh`, `./lib/common.sh`) throughout — no path resolution helpers needed.
 
 ## `lib/common.sh`
 
-Sourced by every install script after the `cd` to project root. Provides:
+Sourced by every install script. Provides:
 
 - `log "msg"` — colored info line (existing helper, lifted from current script)
 - `have <cmd>` — `command -v <cmd> >/dev/null 2>&1` (existing helper)
