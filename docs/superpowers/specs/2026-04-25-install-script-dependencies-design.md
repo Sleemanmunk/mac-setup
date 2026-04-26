@@ -1,47 +1,79 @@
 # Install Script Dependencies — Design
 
-Date: 2026-04-25
+Date: 2026-04-25 (revised after pivot from custom bash dispatcher to Make)
 
 ## Goal
 
-Decompose the existing `install-claude-code.sh` into a small set of single-purpose install scripts that can declare dependencies on each other. Re-running any script (or any of its callers) must be cheap and side-effect-free when everything is already installed.
+Decompose the existing `install-claude-code.sh` into a set of single-purpose install scripts and a `Makefile` that declares the dependencies between them. Re-running `make <thing>` must be cheap and side-effect-free when everything is already installed.
 
-The repo will grow over time as more macOS tools are added (next up: Maccy). The design is for that growth, not just today's two scripts.
+The repo will grow as more macOS tools are added (next up: Maccy).
+
+## Why Make
+
+An earlier iteration of this design built a bash-only system: each install script defined `verify`/`install` subcommands, a `lib/common.sh` provided a `require` helper that ran sibling scripts as subprocesses, and a `dispatch` case statement was duplicated at the bottom of every script.
+
+That worked but was bash-heavy: `set -e` interactions with `||` chains, sourcing-vs-subprocess decisions to avoid function-name collisions, dispatch boilerplate per script, and a small but real "must know bash conventions" tax for anyone reading the code.
+
+Make replaces almost all of that machinery:
+- Dependencies are declared once, in one file (the Makefile), as plain `target: deps` lines.
+- Make automatically dedupes — if two targets share a dependency, the dependency runs once.
+- The "skip if already installed" check is one inline shell expression per recipe (e.g. `@command -v brew >/dev/null 2>&1 || bash install-homebrew.sh`).
+- Each install script becomes 2–10 lines of "do the install" — no dispatch, no `require`, no shared library.
+
+Make ships on macOS via the Xcode Command Line Tools. `/usr/bin/make` is a stub on a CLT-less machine that triggers the CLT GUI installer prompt automatically when first invoked, which means the chicken-and-egg of "need CLT to run make" self-resolves: the user runs `make claude-code`, gets the CLT installer prompt, clicks through, re-runs `make claude-code`, and the chain proceeds.
 
 ## Non-goals
 
-- Version pinning or upgrade detection. `verify` answers "is this installed at all," not "is the right version installed."
-- A top-level `install-everything.sh` orchestrator. Each install script is its own user-facing entry point. A manifest/orchestrator can be added later if the set grows large enough to warrant it.
-- Cross-shell support beyond bash. The user has `chsh`'d to bash; zsh handling is stubbed in the shell-init helper but not implemented.
+- Version pinning or upgrade detection. Recipes check "is this installed at all," not "is the right version installed."
+- A top-level `make all` that installs every tool. Each tool is its own target; the user invokes the ones they want.
+- Cross-shell support beyond bash. The user has chsh'd to bash; zsh handling is out of scope.
 
 ## Layout
 
 ```
 mac-setup/
+├── Makefile
 ├── install-xcode-clt.sh
 ├── install-bash-shell.sh
 ├── install-bash-init.sh
 ├── install-homebrew.sh
 ├── install-claude-code.sh
 ├── install-maccy.sh
-└── lib/
-    └── common.sh
+└── README.md
 ```
 
-## Script contract
+No `lib/` directory; no shared shell library. Each install script is fully self-contained.
 
-Every `install-<name>.sh` accepts a subcommand as its first argument:
+## The Makefile
 
-| Subcommand | Behavior |
-|---|---|
-| `verify` | Cheap, side-effect-free check. Exits `0` if the thing is already installed/configured. Non-zero otherwise. |
-| `install` | Performs the actual installation. May prompt for credentials or trigger GUI installers. Exits non-zero if a human action is required (caller halts; user re-runs after completing the action). |
-| *(no arg)* | Runs `verify || install`. This is the user-facing default. |
+```makefile
+.PHONY: claude-code maccy homebrew bash-init bash-shell xcode-clt
 
-Constraints:
-- `verify` must not mutate state.
-- `install` must be idempotent enough that re-running after a partial failure is safe.
-- `install` may call `require <other>` for its dependencies; `verify` should not (a verified-installed thing implies its deps were satisfied at install time).
+xcode-clt:
+	@xcode-select -p >/dev/null 2>&1 || bash install-xcode-clt.sh
+
+bash-shell:
+	@[ "$$(dscl . -read $$HOME UserShell | awk '{print $$2}')" = "/bin/bash" ] \
+		|| bash install-bash-shell.sh
+
+bash-init: bash-shell
+	@bash install-bash-init.sh
+
+homebrew: xcode-clt bash-init
+	@command -v brew >/dev/null 2>&1 || bash install-homebrew.sh
+
+claude-code: homebrew
+	@command -v claude >/dev/null 2>&1 || bash install-claude-code.sh
+
+maccy: homebrew
+	@[ -d /Applications/Maccy.app ] || bash install-maccy.sh
+```
+
+Notes on the recipe pattern:
+- `@` suppresses command echo so the user only sees the install script's own output when something runs.
+- `$$` escapes `$` for make's two-pass interpolation; the shell sees `$(...)` and `$VAR`.
+- The inline guard (`<check> || bash install-<name>.sh`) is the "skip if installed" optimization. If the check passes, the install script is never invoked.
+- `bash-init` has no inline guard because its check is multi-part (.bashrc exists, .bash_profile sources it, .zprofile/.zshrc clean of stale brew lines). The script itself is internally idempotent — each mutation is guarded — so it's safe to invoke unconditionally.
 
 ## Dependency graph
 
@@ -51,106 +83,168 @@ xcode-clt ───┐
 bash-shell ──► bash-init ──┘            └─► maccy
 ```
 
-- `xcode-clt`: required by `homebrew` (brew bootstrap depends on the Xcode Command Line Tools)
-- `bash-shell`: sets the user's login shell to `/bin/bash`; required by `bash-init`
-- `bash-init`: ensures `~/.bashrc` exists and is sourced from `~/.bash_profile`; required by `homebrew` (so brew's shellenv line can be written once to `.bashrc` and seen by all shell types)
-- `homebrew`: required by `claude-code` and `maccy` (and any future cask install)
+This graph is encoded directly in the Makefile's `target: deps` lines; no graph-walker is needed.
 
-## Working directory and invocation
-
-Scripts are expected to be run from the project root (e.g. `bash install-claude-code.sh`, not `bash /full/path/to/install-claude-code.sh` from elsewhere). This expectation is documented in `README.md`.
-
-Each script does a one-line sanity check at the top:
-
-```bash
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-```
-
-If invoked from the wrong directory, the script fails immediately with a clear message instead of producing confusing errors deeper in the flow. With this expectation in place, install scripts and `require` use plain relative paths (`./install-<name>.sh`, `./lib/common.sh`) throughout — no path resolution helpers needed.
-
-## `lib/common.sh`
-
-Sourced by every install script. Provides:
-
-- `log "msg"` — colored info line (existing helper, lifted from current script)
-- `have <cmd>` — `command -v <cmd> >/dev/null 2>&1` (existing helper)
-- `require <name>` — runs `bash ./install-<name>.sh verify`; if it fails, runs `bash ./install-<name>.sh install`. Subprocess (not source) to keep function namespaces clean across scripts.
-- `add_shell_init_line "<line>"` — idempotent `grep -F`-then-append to `~/.bashrc` (bash case). Cases for other shells (`zsh`) error out with a "add this manually" message until implemented.
-- `load_brew_env` — `eval "$(/opt/homebrew/bin/brew shellenv)"` with `/usr/local` fallback, for callers that need brew on PATH in the current shell after `require homebrew`.
+- `xcode-clt`: required by `homebrew` (the brew installer needs it).
+- `bash-shell`: sets login shell to `/bin/bash`; required by `bash-init`.
+- `bash-init`: sets up `~/.bashrc`/`~/.bash_profile` plumbing and cleans stale brew lines from zsh init files; required by `homebrew` so brew's shellenv line is written once to `.bashrc` and seen by all shell types.
+- `homebrew`: required by `claude-code` and `maccy` (and any future cask install).
 
 ## Per-script behavior
 
+Each script is invoked when its Makefile guard fails. Scripts may assume their dependencies have run (because make ran them first). Scripts trust the underlying tools to be safely re-invokable: `brew install` of an already-installed package is a no-op, `dscl . -change` to the current shell is a no-op, etc. For mutations that aren't naturally idempotent (file edits in `bash-init`), each mutation has its own guard inside the script.
+
 ### `install-xcode-clt.sh`
 
-- `verify`: `xcode-select -p >/dev/null 2>&1`
-- `install`: triggers `xcode-select --install` (GUI installer), prints "complete the installer, then re-run" and exits non-zero. The `require` chain halts; the user re-runs after the GUI completes.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+xcode-select --install || true
+echo "Finish the GUI installer, then re-run make." >&2
+exit 1
+```
+
+Triggers the GUI installer and bails non-zero so make halts. The user re-runs `make <whatever>` after the GUI completes.
 
 ### `install-bash-shell.sh`
 
-- `verify`: `[[ "$(dscl . -read "$HOME" UserShell 2>/dev/null | awk '{print $2}')" == "/bin/bash" ]]`. `dscl` is used (not `$SHELL`) because `$SHELL` doesn't update mid-session after a shell change.
-- `install`: `sudo dscl . -change "$HOME" UserShell <current-shell> /bin/bash`. Uses `sudo dscl` rather than `chsh -s` so that the user enters their sudo password once for the whole chain — `homebrew` also uses sudo within the same minute, and sudo's session cache covers both calls (no second prompt). Using `chsh -s` would prompt for the user's login password separately, on top of the sudo prompt brew needs. No `/etc/shells` check needed — `dscl` doesn't enforce that, and the field is just a stored value. The current-shell argument is read from `dscl . -read "$HOME" UserShell` before the change.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cur="$(dscl . -read "$HOME" UserShell | awk '{print $2}')"
+sudo dscl . -change "$HOME" UserShell "$cur" /bin/bash
+```
+
+Uses `sudo dscl` rather than `chsh -s` so the user enters their sudo password once for the whole chain — `homebrew`'s install also uses sudo within the same minute, and sudo's session cache covers both calls.
 
 ### `install-bash-init.sh`
 
-Depends on: `bash-shell`.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-This script owns the "shell init plumbing for a bash user" invariant. That includes both setting up bash's init files correctly *and* cleaning up stale brew shellenv lines left in zsh init files by the previous version of `install-claude-code.sh` (which wrote to `~/.zprofile`). The cleanup is part of bash-init's scope rather than a separate migration script because the user will only ever have one shell-init story, and bash-init is the script that owns it.
+BASHRC="$HOME/.bashrc"
+BASH_PROFILE="$HOME/.bash_profile"
+SOURCE_LINE='[ -f ~/.bashrc ] && . ~/.bashrc'
 
-- `verify` — all of:
-  - `~/.bashrc` exists
-  - `~/.bash_profile` contains a line that sources `~/.bashrc`
-  - `~/.zprofile` does not exist OR does not contain a `brew shellenv` line
-  - `~/.zshrc` does not exist OR does not contain a `brew shellenv` line
-- `install`:
-  - `touch ~/.bashrc` if missing
-  - if `~/.bash_profile` doesn't already source `.bashrc`, append `[ -f ~/.bashrc ] && . ~/.bashrc`
-  - remove any line matching `brew shellenv` from `~/.zprofile` and `~/.zshrc` if those files exist (using `sed -i ''` on macOS; line is removed entirely, not commented out)
+[ -f "$BASHRC" ] || touch "$BASHRC"
+
+if ! grep -Fqs "$SOURCE_LINE" "$BASH_PROFILE" 2>/dev/null; then
+  printf '\n%s\n' "$SOURCE_LINE" >> "$BASH_PROFILE"
+fi
+
+for f in "$HOME/.zprofile" "$HOME/.zshrc"; do
+  if [ -f "$f" ] && grep -qs 'brew shellenv' "$f"; then
+    sed -i '' '/brew shellenv/d' "$f"
+  fi
+done
+```
+
+Every mutation is guarded. Safe to invoke unconditionally.
+
+The `.zprofile`/`.zshrc` cleanup removes stale `eval "$(... brew shellenv)"` lines left by the previous version of `install-claude-code.sh`. After the user chsh'd to bash, those zsh files are no longer read, but the lines linger; this script removes them.
 
 ### `install-homebrew.sh`
 
-Depends on: `xcode-clt`, `bash-init`.
+The bulk of the original `install-claude-code.sh`'s logic, plus a one-line append to `~/.bashrc` instead of `~/.zprofile`.
 
-- `verify`: `have brew || [[ -x /opt/homebrew/bin/brew || -x /usr/local/bin/brew ]]`
-- `install`:
-  - `require xcode-clt`
-  - `require bash-init`
-  - sudo prime + keepalive (lifted from current script)
-  - `NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
-  - resolve `BREW_PREFIX` to `/opt/homebrew` (Apple Silicon) or `/usr/local` (Intel) by checking which `brew` binary exists
-  - after the install succeeds, call `add_shell_init_line "eval \"\$($BREW_PREFIX/bin/brew shellenv)\""` — the line is written to `.bashrc` and picked up by both login and interactive shells via the bash-init plumbing.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo "This script is for macOS." >&2
+  exit 1
+fi
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  echo "Run as your normal user, not with sudo. Homebrew refuses to install as root." >&2
+  exit 1
+fi
+
+sudo -v
+( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+KEEPALIVE=$!
+trap 'kill "$KEEPALIVE" 2>/dev/null || true' EXIT
+
+NONINTERACTIVE=1 /bin/bash -c \
+  "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+kill "$KEEPALIVE" 2>/dev/null || true
+trap - EXIT
+
+if [[ -x /opt/homebrew/bin/brew ]]; then
+  PREFIX=/opt/homebrew
+elif [[ -x /usr/local/bin/brew ]]; then
+  PREFIX=/usr/local
+else
+  echo "Homebrew install did not produce a brew binary." >&2
+  exit 1
+fi
+
+LINE="eval \"\$($PREFIX/bin/brew shellenv)\""
+grep -Fqs "$LINE" "$HOME/.bashrc" 2>/dev/null \
+  || printf '\n%s\n' "$LINE" >> "$HOME/.bashrc"
+```
 
 ### `install-claude-code.sh`
 
-Depends on: `homebrew`.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+brew install --cask claude-code
+```
 
-- `verify`: `have claude`
-- `install`:
-  - `require homebrew`
-  - `load_brew_env`
-  - `brew install --cask claude-code`
+Make's `homebrew` dependency guarantees brew is installed by the time this script runs. `brew` may not be on PATH yet in this shell session if homebrew was just installed, so the script may need a `eval "$(/opt/homebrew/bin/brew shellenv)"` prelude to find brew. Two options:
+- Make the recipe itself eval brew shellenv before calling the script (clutters the Makefile).
+- Have each cask install script eval brew shellenv at the top.
+
+We'll use the second: each cask install script begins with a brew-on-PATH eval.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+[[ -x /usr/local/bin/brew    ]] && eval "$(/usr/local/bin/brew shellenv)"
+brew install --cask claude-code
+```
+
+(The two `eval` lines are mutually exclusive on any given machine; only one path will exist.)
 
 ### `install-maccy.sh`
 
-Depends on: `homebrew`.
+Same shape as `install-claude-code.sh`:
 
-- `verify`: `[[ -d /Applications/Maccy.app ]]` (Maccy is an app bundle, not a CLI — `have` won't work)
-- `install`:
-  - `require homebrew`
-  - `load_brew_env`
-  - `brew install --cask maccy`
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+[[ -x /usr/local/bin/brew    ]] && eval "$(/usr/local/bin/brew shellenv)"
+brew install --cask maccy
+```
 
-## Idempotency
+## Idempotency model
 
-"Don't re-run when already installed" is enforced by each script's `verify`, not by marker files. Marker files lie when the user uninstalls something out of band; verify always reflects current reality.
+Two layers, on purpose:
 
-`require` does not re-verify after install. It trusts the install's exit code. If a verify-after-install step is wanted later (paranoid mode), it's a one-line addition to `require` — no contract change.
+1. **Makefile guards** — fast-path "already installed?" checks per target. If the guard passes, the script is never invoked. This is what gives us `make claude-code` returning instantly when claude is already there.
+2. **Internal idempotency** — scripts that mutate state (`install-bash-init.sh` in particular) guard each mutation so direct invocation (`bash install-bash-init.sh`) is also safe. The cask install scripts trust `brew install` to no-op on already-installed packages.
+
+If you bypass `make` and run a script directly, the worst case is an extra round-trip to brew (which itself short-circuits). No script causes harm when re-run.
 
 ## Failure modes
 
-All non-zero exits are treated equally: caller halts, user re-runs. There is no distinction between "human action required" (CLT GUI installer in progress) and "real error" (network failure during brew install, sudo password rejected). At this scale, that's an acceptable simplification. If retry-vs-bail logic becomes valuable, the contract can grow specific exit codes without breaking existing scripts.
+A non-zero exit from any script halts make. The user fixes whatever's wrong and re-runs `make <whatever>` — the deps that already succeeded are skipped by their guards, and make resumes at the failed step.
 
-## Shell init scope
+There's no distinction between "human action required" (CLT GUI installer in progress) and "real error" (brew install hit a network failure). At this scale, that's an acceptable simplification.
 
-`add_shell_init_line` writes to `~/.bashrc` only. `bash-init` guarantees `.bash_profile` sources `.bashrc`, so both login and non-login interactive bash shells see the line. This single source of truth covers Terminal.app, iTerm2, VSCode integrated terminals, and tmux panes uniformly.
+## Bootstrap ordering
 
-`zsh` and other shells fall through to an error path in `add_shell_init_line` with instructions to add the line manually. Adding zsh support later is one `case` arm plus a parallel `install-zsh-init.sh`; not in scope today.
+`make` itself is provided by `/usr/bin/make`, which is a stub on macOS that triggers the Xcode Command Line Tools GUI installer when invoked on a CLT-less system. So:
+
+1. User runs `make claude-code` on a fresh Mac.
+2. macOS prompts for CLT install (because `make` itself isn't there until CLT is).
+3. User clicks through the installer.
+4. User re-runs `make claude-code`. Make is now available; the dependency chain proceeds.
+5. The Makefile's `xcode-clt` target's guard now passes (`xcode-select -p` succeeds), so `install-xcode-clt.sh` is never invoked.
+
+The `xcode-clt` target and its install script remain useful: future tools that need CLT directly (without going through brew) can declare the dep, and the script handles the rare case where someone tries to bootstrap without going through `make` first.

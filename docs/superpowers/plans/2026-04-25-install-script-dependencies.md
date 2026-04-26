@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Decompose `install-claude-code.sh` into single-purpose, dependency-aware install scripts (xcode-clt, bash-shell, bash-init, homebrew, claude-code, maccy) sharing a small `lib/common.sh` library.
+**Goal:** Decompose `install-claude-code.sh` into single-purpose install scripts orchestrated by a `Makefile` that declares dependencies between them.
 
-**Architecture:** Every `install-<name>.sh` script accepts `verify`/`install` subcommands (default: `verify || install`). A `require <name>` helper in `lib/common.sh` invokes a sibling script's `verify`, falling through to `install` if it fails. Scripts are invoked from the project root; each script's first non-shebang lines source `./lib/common.sh`.
+**Architecture:** Make handles the dependency graph and the "skip if already installed" guards. Each install script is 2–10 lines of "do the install" with no shared library, no dispatch logic, and no inter-script dependencies in code.
 
-**Tech Stack:** bash 3.2 (system bash on macOS), `dscl` for shell-database changes, Homebrew for the actual installs.
+**Tech Stack:** GNU/BSD-portable Make + bash 3.2-compatible scripts.
 
 **Spec:** `docs/superpowers/specs/2026-04-25-install-script-dependencies-design.md`
+
+**Pivot note:** An earlier version of this plan (commit `e0b73ec`) used a custom bash dispatcher with a `lib/common.sh` and a `require` helper. Task 1 of that plan (committing `lib/common.sh`) has already been merged at `0009271`. We're pivoting to the Makefile approach because the bash dispatcher imposed a "must know bash" tax (set-e interactions, source-vs-subprocess, function namespacing) that this design avoids entirely. Task 1 below removes `lib/common.sh`.
 
 ---
 
@@ -16,108 +18,103 @@
 
 | Path | Responsibility |
 |---|---|
-| `lib/common.sh` | Sourced helpers: `log`, `have`, `require`, `add_shell_init_line`, `load_brew_env` |
-| `install-xcode-clt.sh` | Verify/install Xcode Command Line Tools (GUI installer if missing) |
-| `install-bash-shell.sh` | Verify/install login shell == `/bin/bash` (via `sudo dscl . -change`) |
-| `install-bash-init.sh` | Verify/install bash init plumbing + cleanup of stale brew lines in `.zprofile`/`.zshrc` |
-| `install-homebrew.sh` | Verify/install Homebrew; writes shellenv line to `.bashrc` via the helper |
-| `install-claude-code.sh` | Thin wrapper: `require homebrew && brew install --cask claude-code` (rewrites the existing monolithic script) |
-| `install-maccy.sh` | Same shape as claude-code, but for Maccy |
-| `README.md` | Already updated to document "run from project root" expectation |
-
-All `install-*.sh` files use the same skeleton:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
-
-verify() { ...; }
-install_step() { ...; }
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
-```
-
-The dispatch block is identical across every script — only `verify` and `install_step` differ.
+| `Makefile` | Dependency graph + per-target "skip if installed" guards |
+| `install-xcode-clt.sh` | Trigger the CLT GUI installer and bail with a re-run message |
+| `install-bash-shell.sh` | Set login shell to `/bin/bash` via `sudo dscl . -change` |
+| `install-bash-init.sh` | Ensure `~/.bashrc` exists and is sourced from `~/.bash_profile`; clean stale brew lines from `.zprofile`/`.zshrc` |
+| `install-homebrew.sh` | Run the Homebrew installer; append the brew shellenv line to `~/.bashrc` |
+| `install-claude-code.sh` | `brew install --cask claude-code` (with brew-on-PATH prelude) |
+| `install-maccy.sh` | `brew install --cask maccy` (with brew-on-PATH prelude) |
+| `lib/common.sh` | **REMOVED** — no longer needed in the new design |
 
 ---
 
-### Task 1: Create `lib/common.sh`
+### Task 1: Remove `lib/common.sh`
 
 **Files:**
-- Create: `lib/common.sh`
+- Delete: `lib/common.sh`
+- Delete: `lib/` (becomes empty)
 
-- [ ] **Step 1: Create the file**
+The file was created in commit `0009271` as part of the previous bash-dispatcher design. The Makefile-based design has no use for it.
+
+- [ ] **Step 1: Remove the file and its directory**
 
 ```bash
-# Sourced by every install-*.sh script.
-# The caller is expected to run from the project root (siblings on disk).
-
-log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
-
-have() { command -v "$1" >/dev/null 2>&1; }
-
-# Run a sibling install script's verify; if it fails, run its install.
-# Subprocess (not source) so each script gets a clean function namespace.
-require() {
-  local name="$1"
-  bash "./install-$name.sh" verify >/dev/null 2>&1 || bash "./install-$name.sh" install
-}
-
-# Append a line to the user's shell init file if not already present.
-# Detects the shell authoritatively via dscl (since $SHELL doesn't update
-# mid-session after a chsh / dscl change).
-add_shell_init_line() {
-  local line="$1"
-  local current_shell file
-  current_shell="$(dscl . -read "$HOME" UserShell 2>/dev/null | awk '{print $2}')"
-  case "$(basename "$current_shell")" in
-    bash) file="$HOME/.bashrc" ;;
-    *)
-      echo "Unknown shell ($current_shell); add this manually: $line" >&2
-      return 1
-      ;;
-  esac
-  if ! grep -Fqs "$line" "$file" 2>/dev/null; then
-    log "Adding to ${file}: $line"
-    printf '\n%s\n' "$line" >> "$file"
-  fi
-}
-
-# Make brew available on PATH in the current shell.
-load_brew_env() {
-  if [[ -x /opt/homebrew/bin/brew ]]; then
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-  elif [[ -x /usr/local/bin/brew ]]; then
-    eval "$(/usr/local/bin/brew shellenv)"
-  else
-    echo "load_brew_env: brew not found in /opt/homebrew or /usr/local" >&2
-    return 1
-  fi
-}
+rm lib/common.sh
+rmdir lib
 ```
 
-- [ ] **Step 2: Syntax-check**
+- [ ] **Step 2: Confirm removal**
 
-Run: `bash -n lib/common.sh`
-Expected: no output, exit 0
+Run: `ls lib 2>&1 || echo "lib/ removed"`
+Expected: `ls: lib: No such file or directory` (or equivalent), followed by `lib/ removed`
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add lib/common.sh
-git commit -m "Add lib/common.sh with require/log/have/add_shell_init_line/load_brew_env"
+git add -A
+git commit -m "Remove lib/common.sh; pivot to Makefile-orchestrated install"
+```
+
+(`git add -A` stages the deletion.)
+
+---
+
+### Task 2: Create `Makefile`
+
+**Files:**
+- Create: `Makefile`
+
+- [ ] **Step 1: Create the file**
+
+The file uses **TAB** indentation for recipe lines (not spaces — Make is strict on this).
+
+```makefile
+.PHONY: claude-code maccy homebrew bash-init bash-shell xcode-clt
+
+xcode-clt:
+	@xcode-select -p >/dev/null 2>&1 || bash install-xcode-clt.sh
+
+bash-shell:
+	@[ "$$(dscl . -read $$HOME UserShell | awk '{print $$2}')" = "/bin/bash" ] \
+		|| bash install-bash-shell.sh
+
+bash-init: bash-shell
+	@bash install-bash-init.sh
+
+homebrew: xcode-clt bash-init
+	@command -v brew >/dev/null 2>&1 || bash install-homebrew.sh
+
+claude-code: homebrew
+	@command -v claude >/dev/null 2>&1 || bash install-claude-code.sh
+
+maccy: homebrew
+	@[ -d /Applications/Maccy.app ] || bash install-maccy.sh
+```
+
+- [ ] **Step 2: Verify TAB indentation**
+
+Run: `cat -A Makefile | grep -E '^[\^ ]' | head -5`
+Expected: each recipe line starts with `^I` (the visible representation of a TAB). If you see leading spaces, the Makefile is broken — re-create it with tabs.
+
+Alternative check: `awk '/^[^.#]/ && NR>1 && /^ /' Makefile`
+Expected: no output (no recipe lines start with a space).
+
+- [ ] **Step 3: Dry-run test**
+
+Run: `make -n claude-code`
+Expected: prints the recipes for `xcode-clt`, `bash-init` (which depends on `bash-shell`), `homebrew`, and `claude-code` in dependency order. No errors about missing targets or syntax.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add Makefile
+git commit -m "Add Makefile for install-script orchestration"
 ```
 
 ---
 
-### Task 2: Create `install-xcode-clt.sh`
+### Task 3: Create `install-xcode-clt.sh`
 
 **Files:**
 - Create: `install-xcode-clt.sh`
@@ -127,26 +124,10 @@ git commit -m "Add lib/common.sh with require/log/have/add_shell_init_line/load_
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
 
-verify() {
-  xcode-select -p >/dev/null 2>&1
-}
-
-install_step() {
-  log "Installing Xcode Command Line Tools (a GUI prompt will appear)…"
-  xcode-select --install || true
-  echo "Finish the installer, then re-run this script." >&2
-  exit 1
-}
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
+xcode-select --install || true
+echo "Finish the GUI installer, then re-run make." >&2
+exit 1
 ```
 
 - [ ] **Step 2: Syntax-check**
@@ -154,12 +135,7 @@ esac
 Run: `bash -n install-xcode-clt.sh`
 Expected: no output, exit 0
 
-- [ ] **Step 3: Run verify (CLT is already installed on this machine)**
-
-Run: `bash install-xcode-clt.sh verify; echo "exit=$?"`
-Expected: `exit=0`
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add install-xcode-clt.sh
@@ -168,7 +144,7 @@ git commit -m "Add install-xcode-clt.sh"
 
 ---
 
-### Task 3: Create `install-bash-shell.sh`
+### Task 4: Create `install-bash-shell.sh`
 
 **Files:**
 - Create: `install-bash-shell.sh`
@@ -178,30 +154,9 @@ git commit -m "Add install-xcode-clt.sh"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
 
-current_shell() {
-  dscl . -read "$HOME" UserShell 2>/dev/null | awk '{print $2}'
-}
-
-verify() {
-  [[ "$(current_shell)" == "/bin/bash" ]]
-}
-
-install_step() {
-  local cur
-  cur="$(current_shell)"
-  log "Setting login shell to /bin/bash (was: $cur)…"
-  sudo dscl . -change "$HOME" UserShell "$cur" /bin/bash
-}
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
+cur="$(dscl . -read "$HOME" UserShell | awk '{print $2}')"
+sudo dscl . -change "$HOME" UserShell "$cur" /bin/bash
 ```
 
 - [ ] **Step 2: Syntax-check**
@@ -209,12 +164,7 @@ esac
 Run: `bash -n install-bash-shell.sh`
 Expected: no output, exit 0
 
-- [ ] **Step 3: Run verify (user already chsh'd to bash)**
-
-Run: `bash install-bash-shell.sh verify; echo "exit=$?"`
-Expected: `exit=0`
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add install-bash-shell.sh
@@ -223,7 +173,7 @@ git commit -m "Add install-bash-shell.sh"
 
 ---
 
-### Task 4: Create `install-bash-init.sh`
+### Task 5: Create `install-bash-init.sh`
 
 **Files:**
 - Create: `install-bash-init.sh`
@@ -233,77 +183,53 @@ git commit -m "Add install-bash-shell.sh"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
 
-BASH_PROFILE="$HOME/.bash_profile"
 BASHRC="$HOME/.bashrc"
-ZPROFILE="$HOME/.zprofile"
-ZSHRC="$HOME/.zshrc"
-SOURCE_BASHRC_LINE='[ -f ~/.bashrc ] && . ~/.bashrc'
+BASH_PROFILE="$HOME/.bash_profile"
+SOURCE_LINE='[ -f ~/.bashrc ] && . ~/.bashrc'
 
-bashrc_exists() { [[ -f "$BASHRC" ]]; }
+[ -f "$BASHRC" ] || touch "$BASHRC"
 
-bash_profile_sources_bashrc() {
-  [[ -f "$BASH_PROFILE" ]] && grep -Fqs "$SOURCE_BASHRC_LINE" "$BASH_PROFILE"
-}
+if ! grep -Fqs "$SOURCE_LINE" "$BASH_PROFILE" 2>/dev/null; then
+  printf '\n%s\n' "$SOURCE_LINE" >> "$BASH_PROFILE"
+fi
 
-zsh_init_clean() {
-  local f
-  for f in "$ZPROFILE" "$ZSHRC"; do
-    [[ -f "$f" ]] || continue
-    grep -qs 'brew shellenv' "$f" && return 1
-  done
-  return 0
-}
-
-verify() {
-  bashrc_exists && bash_profile_sources_bashrc && zsh_init_clean
-}
-
-install_step() {
-  require bash-shell
-
-  if ! bashrc_exists; then
-    log "Creating $BASHRC"
-    touch "$BASHRC"
+for f in "$HOME/.zprofile" "$HOME/.zshrc"; do
+  if [ -f "$f" ] && grep -qs 'brew shellenv' "$f"; then
+    sed -i '' '/brew shellenv/d' "$f"
   fi
-
-  if ! bash_profile_sources_bashrc; then
-    log "Configuring $BASH_PROFILE to source $BASHRC"
-    printf '\n%s\n' "$SOURCE_BASHRC_LINE" >> "$BASH_PROFILE"
-  fi
-
-  local f
-  for f in "$ZPROFILE" "$ZSHRC"; do
-    if [[ -f "$f" ]] && grep -qs 'brew shellenv' "$f"; then
-      log "Removing stale brew shellenv line from $f"
-      sed -i '' '/brew shellenv/d' "$f"
-    fi
-  done
-}
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
+done
 ```
+
+Note the `sed -i ''` — the empty-string argument after `-i` is required on macOS (BSD sed). Don't "fix" it to `sed -i`.
 
 - [ ] **Step 2: Syntax-check**
 
 Run: `bash -n install-bash-init.sh`
 Expected: no output, exit 0
 
-- [ ] **Step 3: Run verify before any cleanup**
+- [ ] **Step 3: Run the script (it's idempotent and may do useful work on this machine)**
 
-Run: `bash install-bash-init.sh verify; echo "exit=$?"`
-Expected: `exit=1` if either the `.bash_profile` source line is missing OR `.zprofile` has the stale brew line from the previous version of `install-claude-code.sh`. Either condition is the reason this script exists.
+Run: `bash install-bash-init.sh`
+Expected: exit 0. May produce no output (if everything is already in order) or silently mutate `~/.bash_profile` / `~/.zprofile` / `~/.zshrc` to fix issues.
 
-(If the machine somehow already has the bash-init plumbing AND no stale zsh lines, verify will return 0; the rest of the integration check will still exercise this script via `require` in install-homebrew.)
+- [ ] **Step 4: Verify the post-state**
 
-- [ ] **Step 4: Commit**
+Run:
+```bash
+grep -F '[ -f ~/.bashrc ] && . ~/.bashrc' ~/.bash_profile && echo "bash_profile sources bashrc: OK"
+grep -qs 'brew shellenv' ~/.zprofile ~/.zshrc 2>/dev/null && echo "STALE BREW LINES STILL PRESENT" || echo "zsh init clean: OK"
+```
+Expected: both lines print "OK" (no "STALE BREW LINES" message).
+
+- [ ] **Step 5: Run the script again to confirm idempotency**
+
+Run: `bash install-bash-init.sh`
+Expected: exit 0, no further mutations (no new lines appended to `.bash_profile`).
+
+Verify: `wc -l ~/.bash_profile` before and after; line count unchanged on the second run.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add install-bash-init.sh
@@ -312,70 +238,51 @@ git commit -m "Add install-bash-init.sh with stale .zprofile/.zshrc cleanup"
 
 ---
 
-### Task 5: Create `install-homebrew.sh`
+### Task 6: Create `install-homebrew.sh`
 
 **Files:**
 - Create: `install-homebrew.sh`
 
-This is the bulk of the logic lifted out of the existing `install-claude-code.sh`.
+This is the bulk of the original `install-claude-code.sh`'s logic.
 
 - [ ] **Step 1: Create the file**
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
 
-verify() {
-  have brew || [[ -x /opt/homebrew/bin/brew || -x /usr/local/bin/brew ]]
-}
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo "This script is for macOS." >&2
+  exit 1
+fi
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  echo "Run as your normal user, not with sudo. Homebrew refuses to install as root." >&2
+  exit 1
+fi
 
-install_step() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "This script is for macOS." >&2
-    exit 1
-  fi
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    echo "Run as your normal user, not with sudo. Homebrew refuses to install as root." >&2
-    exit 1
-  fi
+sudo -v
+( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+KEEPALIVE=$!
+trap 'kill "$KEEPALIVE" 2>/dev/null || true' EXIT
 
-  require xcode-clt
-  require bash-init
+NONINTERACTIVE=1 /bin/bash -c \
+  "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-  log "Priming sudo (Homebrew's non-interactive installer needs cached credentials)…"
-  sudo -v
-  ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
-  local keepalive_pid=$!
-  trap 'kill "$keepalive_pid" 2>/dev/null || true' EXIT
+kill "$KEEPALIVE" 2>/dev/null || true
+trap - EXIT
 
-  log "Installing Homebrew…"
-  NONINTERACTIVE=1 /bin/bash -c \
-    "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+if [[ -x /opt/homebrew/bin/brew ]]; then
+  PREFIX=/opt/homebrew
+elif [[ -x /usr/local/bin/brew ]]; then
+  PREFIX=/usr/local
+else
+  echo "Homebrew install did not produce a brew binary." >&2
+  exit 1
+fi
 
-  kill "$keepalive_pid" 2>/dev/null || true
-  trap - EXIT
-
-  local brew_prefix
-  if [[ -x /opt/homebrew/bin/brew ]]; then
-    brew_prefix=/opt/homebrew
-  elif [[ -x /usr/local/bin/brew ]]; then
-    brew_prefix=/usr/local
-  else
-    echo "Homebrew install did not produce a brew binary." >&2
-    exit 1
-  fi
-
-  add_shell_init_line "eval \"\$($brew_prefix/bin/brew shellenv)\""
-}
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
+LINE="eval \"\$($PREFIX/bin/brew shellenv)\""
+grep -Fqs "$LINE" "$HOME/.bashrc" 2>/dev/null \
+  || printf '\n%s\n' "$LINE" >> "$HOME/.bashrc"
 ```
 
 - [ ] **Step 2: Syntax-check**
@@ -383,12 +290,7 @@ esac
 Run: `bash -n install-homebrew.sh`
 Expected: no output, exit 0
 
-- [ ] **Step 3: Run verify (brew is already installed on this machine)**
-
-Run: `bash install-homebrew.sh verify; echo "exit=$?"`
-Expected: `exit=0`
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add install-homebrew.sh
@@ -397,7 +299,7 @@ git commit -m "Extract install-homebrew.sh from install-claude-code.sh"
 
 ---
 
-### Task 6: Rewrite `install-claude-code.sh`
+### Task 7: Rewrite `install-claude-code.sh`
 
 **Files:**
 - Modify: `install-claude-code.sh` (full rewrite — replace all 76 lines with the thin version below)
@@ -407,48 +309,30 @@ git commit -m "Extract install-homebrew.sh from install-claude-code.sh"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
 
-verify() {
-  have claude
-}
+[[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+[[ -x /usr/local/bin/brew    ]] && eval "$(/usr/local/bin/brew shellenv)"
 
-install_step() {
-  require homebrew
-  load_brew_env
-  log "Installing Claude Code via Homebrew cask…"
-  brew install --cask claude-code
-}
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
+brew install --cask claude-code
 ```
+
+The two `eval` lines are mutually exclusive on any given machine; only one path will exist. This makes `brew` available on PATH for the install command, regardless of whether the calling shell already has the shellenv eval'd.
 
 - [ ] **Step 2: Syntax-check**
 
 Run: `bash -n install-claude-code.sh`
 Expected: no output, exit 0
 
-- [ ] **Step 3: Run verify (claude is already installed on this machine)**
-
-Run: `bash install-claude-code.sh verify; echo "exit=$?"`
-Expected: `exit=0`
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add install-claude-code.sh
-git commit -m "Rewrite install-claude-code.sh as thin require-homebrew wrapper"
+git commit -m "Rewrite install-claude-code.sh as thin brew install wrapper"
 ```
 
 ---
 
-### Task 7: Create `install-maccy.sh`
+### Task 8: Create `install-maccy.sh`
 
 **Files:**
 - Create: `install-maccy.sh`
@@ -458,26 +342,11 @@ git commit -m "Rewrite install-claude-code.sh as thin require-homebrew wrapper"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -f ./lib/common.sh ]] || { echo "Run from the mac-setup project root." >&2; exit 1; }
-source ./lib/common.sh
 
-verify() {
-  [[ -d /Applications/Maccy.app ]]
-}
+[[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+[[ -x /usr/local/bin/brew    ]] && eval "$(/usr/local/bin/brew shellenv)"
 
-install_step() {
-  require homebrew
-  load_brew_env
-  log "Installing Maccy via Homebrew cask…"
-  brew install --cask maccy
-}
-
-case "${1:-default}" in
-  verify)  verify ;;
-  install) install_step ;;
-  default) verify || install_step ;;
-  *)       echo "Usage: $0 [verify|install]" >&2; exit 2 ;;
-esac
+brew install --cask maccy
 ```
 
 - [ ] **Step 2: Syntax-check**
@@ -485,12 +354,7 @@ esac
 Run: `bash -n install-maccy.sh`
 Expected: no output, exit 0
 
-- [ ] **Step 3: Run verify (maccy is not yet installed on this machine)**
-
-Run: `bash install-maccy.sh verify; echo "exit=$?"`
-Expected: `exit=1` (Maccy.app does not exist in /Applications)
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add install-maccy.sh
@@ -499,96 +363,103 @@ git commit -m "Add install-maccy.sh"
 
 ---
 
-### Task 8: Make install scripts executable
+### Task 9: Update README
 
 **Files:**
-- Modify (perms only): `install-*.sh`
+- Modify: `README.md`
 
-The existing `install-claude-code.sh` had its executable bit. Since we invoke via `bash install-foo.sh`, the bit isn't strictly required, but keeping it consistent across all install scripts is nice (and lets `./install-foo.sh` work too).
+The current README says "Run scripts from the project root" with a `bash install-claude-code.sh` example. Update to point at `make`.
 
-- [ ] **Step 1: chmod +x**
+- [ ] **Step 1: Replace `README.md` with**
 
-Run: `chmod +x install-*.sh`
+```markdown
+# mac-setup
 
-- [ ] **Step 2: Verify**
+Install scripts for setting up a fresh macOS machine, orchestrated by Make.
 
-Run: `ls -l install-*.sh`
-Expected: every install script shows `-rwxr-xr-x` (or similar with the `x` bits set).
-
-- [ ] **Step 3: Commit**
+## Usage
 
 ```bash
-git add -A
-git commit -m "Make install-*.sh executable"
+make claude-code   # install Claude Code (and its dependencies)
+make maccy         # install Maccy
 ```
 
-(`git add -A` is intentional here so mode bits get staged.)
+Each target's dependencies are installed automatically. Re-running a target is cheap when the underlying tool is already installed.
+
+## On a fresh Mac
+
+The first `make` invocation on a Mac without the Xcode Command Line Tools will trigger the GUI installer for the CLT (because `make` itself is provided by the CLT). Click through the installer, then re-run your `make` command.
+\```
+
+```
+
+(Note: the inner triple-backticks for the bash code block need to be regular ` ``` ` — the escaped versions above are an artifact of writing this plan as Markdown-inside-Markdown. Use the unescaped form in the actual file.)
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add README.md
+git commit -m "Update README for Makefile-based install"
+```
 
 ---
 
-### Task 9: Integration check
+### Task 10: Integration check
 
-**Files:** none (read-only verification on disk).
+**Files:** none (verification only).
 
-The verify steps in earlier tasks confirmed each script's `verify` runs in isolation. This task exercises the dependency chain end-to-end and the actual cleanup work.
-
-- [ ] **Step 1: Snapshot current shell-init state for comparison**
+- [ ] **Step 1: Snapshot shell-init state**
 
 Run:
 ```bash
 ls -l ~/.bash_profile ~/.bashrc ~/.zprofile ~/.zshrc 2>&1 || true
 echo '---'
-grep -H 'brew shellenv' ~/.zprofile ~/.zshrc 2>/dev/null || echo "(no brew shellenv lines found)"
+grep -H 'brew shellenv' ~/.zprofile ~/.zshrc 2>/dev/null || echo "(no brew shellenv lines in zsh files)"
 echo '---'
-grep -Fqs '[ -f ~/.bashrc ] && . ~/.bashrc' ~/.bash_profile && echo ".bash_profile sources .bashrc: yes" || echo ".bash_profile sources .bashrc: no"
+grep -Fqs '[ -f ~/.bashrc ] && . ~/.bashrc' ~/.bash_profile && echo "bash_profile sources bashrc: yes" || echo "bash_profile sources bashrc: no"
 ```
 
-Note the output. After running install-bash-init.sh below, expect:
-- `.bashrc` to exist (created if missing)
-- `.bash_profile` sources `.bashrc`: yes
-- no `brew shellenv` lines in `.zprofile` or `.zshrc`
+Note the output. After the make run below, expect:
+- `.bashrc` exists (created if missing)
+- `bash_profile sources bashrc: yes`
+- no `brew shellenv` lines in `.zprofile`/`.zshrc`
 
-- [ ] **Step 2: Run install-bash-init directly to exercise the cleanup work**
+(Task 5's verification may have already left things in this state. If so, that's fine — Task 10 just confirms it.)
 
-Run: `bash install-bash-init.sh`
-Expected: log lines describing whatever fixes are applied (creating `.bashrc`, adding source line to `.bash_profile`, removing stale brew line from `.zprofile`). On a machine with nothing to fix, no log output and exit 0.
+- [ ] **Step 2: Run `make claude-code` (verify path)**
 
-- [ ] **Step 3: Verify install-bash-init now passes verify**
+Run: `make claude-code`
+Expected: each guard passes silently (`xcode-clt`, `homebrew`, `claude-code` all installed), no script invocations needed. `bash-init` always runs but does no work because everything is already in order. Total runtime: under a second.
 
-Run: `bash install-bash-init.sh verify; echo "exit=$?"`
-Expected: `exit=0`
+- [ ] **Step 3: Run `make claude-code` again to confirm cheap re-run**
 
-- [ ] **Step 4: Re-snapshot to confirm the cleanup happened**
+Run: `make claude-code`
+Expected: same as Step 2 — fast, no install, no output (or very minimal output).
 
-Re-run the inspection from Step 1. Expect the output from Step 1's "expected" notes to match.
+- [ ] **Step 4: Optional — install Maccy for real**
 
-- [ ] **Step 5: Run install-claude-code (verify path)**
+This is the only step that performs a fresh install; gate it on user confirmation. Run only if you want Maccy installed now.
 
-Run: `bash install-claude-code.sh`
-Expected: `verify` passes (claude already installed) → script exits 0 with no install output. This confirms the rewritten script is wired up correctly.
-
-- [ ] **Step 6: Optional — install Maccy for real**
-
-This is the only step that performs a fresh install; gate it on user confirmation. Run only if the user wants to install Maccy now.
-
-Run: `bash install-maccy.sh`
+Run: `make maccy`
 Expected:
-- `require homebrew` → verify passes (brew already installed) → returns immediately
-- `load_brew_env` runs
-- `brew install --cask maccy` runs and installs Maccy
-- Re-running `bash install-maccy.sh verify` afterwards exits 0
+- `xcode-clt`, `bash-init`, `homebrew` guards all pass
+- `maccy` guard fails (no `/Applications/Maccy.app`)
+- `install-maccy.sh` runs, eval's brew shellenv, runs `brew install --cask maccy`
+- Maccy installs
 
-- [ ] **Step 7: Final state check**
+After: `make maccy` again should pass the guard and exit instantly.
 
-Run: `git status; git log --oneline -10`
-Expected: clean working tree; commits from tasks 1–8 present.
+- [ ] **Step 5: Final state check**
+
+Run: `git status; git log --oneline -12`
+Expected: clean working tree; commits from tasks 1–9 present (10 commits in total since branch was cut, including the original spec/plan commits).
 
 ---
 
 ## Notes for the implementer
 
-- **Don't run scripts from outside the project root.** The sanity check at the top of each script will refuse with a clear message; this is by design.
-- **`set -e` interaction with `verify`:** the `verify || install_step` pattern is what keeps a non-zero exit from `verify` from killing the script. Don't restructure that line.
-- **`require` is intentionally not re-verifying after install.** If the install's exit code is 0, we trust it. The spec discusses this as a future paranoid-mode option.
-- **bash 3.2 compatibility:** macOS ships bash 3.2; avoid bash 4+ features (no associative arrays, no `${var,,}`, etc.). The code in this plan is 3.2-compatible.
-- **macOS `sed -i ''`:** the empty-string argument after `-i` is required on macOS (BSD sed); GNU sed doesn't need it. Don't "fix" this to `sed -i`.
+- **Tabs in Makefile recipes.** Make rejects spaces. If the file is created via a tool that auto-converts tabs, fix it. The `cat -A` check in Task 2 verifies this.
+- **`sed -i ''` is intentional.** macOS's BSD sed requires an argument after `-i` (an empty string for "no backup"). GNU sed doesn't. Don't "fix" this.
+- **Script invocation from `make`** is `bash install-foo.sh`, not `./install-foo.sh`, so the executable bit is irrelevant. Don't bother with `chmod +x`.
+- **The `set -e` interactions you'd worry about in a more complex bash codebase don't really apply here** — each script is short and linear, with no `||` chains in conditional positions that would suppress `set -e`. If a script does anything tricky, the spec or plan calls it out.
+- **bash 3.2 compatibility:** macOS ships bash 3.2; avoid bash 4+ features. Nothing in this plan uses any.
