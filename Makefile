@@ -1,4 +1,4 @@
-.PHONY: claude-code maccy homebrew bash-init bash-shell xcode-clt
+.PHONY: claude-code maccy node homebrew bash-init bash-shell xcode-clt
 
 xcode-clt:
 	@xcode-select -p >/dev/null 2>&1 || bash install-xcode-clt.sh
@@ -18,3 +18,6 @@ claude-code: homebrew
 
 maccy: homebrew
 	@[ -d /Applications/Maccy.app ] || bash install-maccy.sh
+
+node: homebrew
+	@command -v node >/dev/null 2>&1 || bash install-node.sh
